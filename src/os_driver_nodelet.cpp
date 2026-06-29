@@ -30,6 +30,7 @@
 #include <std_msgs/Header.h>
 #include <deque>
 #include <mutex>
+#include <cstdint>
 
 using ouster::sdk::core::ImuPacket;
 using ouster::sdk::core::LidarPacket;
@@ -121,7 +122,7 @@ namespace ouster_ros
         {
             std::lock_guard<std::mutex> lock(senti_stamp_mutex_);
 
-            senti_stamp_queue_.push_back(msg->stamp);
+            senti_stamp_queue_.push_back({msg->stamp, msg->seq});
 
             while (senti_stamp_queue_.size() > 20)
             {
@@ -236,8 +237,9 @@ namespace ouster_ros
                                 {
                                     continue;
                                 }
-
+                                ++lidar_scans;
                                 ros::Time sentiboard_stamp;
+                                std::uint32_t counter;
                                 bool has_sentiboard_stamp = false;
 
                                 {
@@ -245,23 +247,29 @@ namespace ouster_ros
 
                                     if (!senti_stamp_queue_.empty())
                                     {
-                                        sentiboard_stamp = senti_stamp_queue_.front();
+                                        sentiboard_stamp = senti_stamp_queue_.front().stamp;
+                                        counter = senti_stamp_queue_.front().seq;
                                         senti_stamp_queue_.pop_front();
                                         has_sentiboard_stamp = true;
                                     }
+                                   
                                 }
 
                                 if (has_sentiboard_stamp)
                                 {
                                     sensor_msgs::PointCloud2 synced_msg = *msgs[i];
                                     synced_msg.header.stamp = sentiboard_stamp;
+                                    synced_msg.header.seq = counter;
                                     synced_lidar_pub.publish(synced_msg);
                                 }
                                 else
                                 {
+                                    ++missed_ic; 
                                     NODELET_WARN_THROTTLE(
                                         1.0,
                                         "No Sentiboard timestamp available for Ouster pointcloud");
+                                    NODELET_WARN_THROTTLE(1.0, "Missed ic. " << missed_ic 
+                                                            << ", Total lidar msgs: " << lidar_scans);
                                 }
                             }
                         }));
@@ -387,8 +395,15 @@ namespace ouster_ros
         ros::Subscriber senti_lidar_ic_sub;
         ros::Publisher synced_lidar_pub;
 
-        std::deque<ros::Time> senti_stamp_queue_;
+        //std::deque<ros::Time> senti_stamp_queue_;
+        struct SentiTime{
+            ros::Time stamp;
+            std::uint32_t seq;
+        };
+        std::deque<SentiTime> senti_stamp_queue_;
         std::mutex senti_stamp_mutex_;
+        std::uint32_t missed_ic;
+        std::uint64_t lidar_scans;
     };
 
 } // namespace ouster_ros
