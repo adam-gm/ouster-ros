@@ -27,6 +27,11 @@
 #include "point_cloud_processor_factory.h"
 #include "telemetry_handler.h"
 
+#include <std_msgs/Header.h>
+#include <deque>
+#include <mutex>
+#include <cstdint>
+
 using ouster::sdk::core::ImuPacket;
 using ouster::sdk::core::LidarPacket;
 
@@ -46,7 +51,15 @@ class OusterDriver : public OusterSensor {
             pnh.param("proc_mask", std::string{"IMU|PCL|SCAN|IMG|RAW"});
         auto tokens = impl::parse_tokens(proc_mask, '|');
         if (impl::check_token(tokens, "IMU")) create_imu_pub();
-        if (impl::check_token(tokens, "PCL")) create_point_cloud_pubs();
+        if (impl::check_token(tokens, "PCL")) 
+        {
+            create_point_cloud_pubs();
+            create_synced_point_cloud_pub();
+
+            senti_lidar_ic_sub = getNodeHandle().subscribe(
+                "/senti/senti/lidar/ic", 100,
+                &OusterDriver::sentiLidarIcCallback, this);
+        };
         if (impl::check_token(tokens, "SCAN")) create_laser_scan_pubs();
         if (impl::check_token(tokens, "IMG")) create_image_pubs();
         if (impl::check_token(tokens, "TLM")) create_telemetry_pub();
@@ -82,6 +95,56 @@ class OusterDriver : public OusterSensor {
                 topic_for_return("points", i), 10);
         }
     }
+
+    void create_synced_point_cloud_pub()
+        {
+            synced_lidar_pub = getNodeHandle().advertise<sensor_msgs::PointCloud2>(
+                "/synched/ouster/points", 10);
+        }
+    
+    void sentiLidarIcCallback(const std_msgs::Header::ConstPtr &msg)
+        {
+	    sensor_msgs::PointCloud2 cloud_to_publish;
+	    bool publish_pending = false;
+
+	 {
+            std::lock_guard<std::mutex> lock(senti_stamp_mutex_);
+	    
+	    if(has_pending_cloud_) {
+		cloud_to_publish = pending_cloud_;
+		cloud_to_publish.header.stamp = msg->stamp;
+		cloud_to_publish.header.seq = msg->seq;
+
+            	has_pending_cloud_ = false;
+            	publish_pending = true;
+	    }
+	
+	    else{
+		NODELET_INFO_STREAM_THROTTLE(1.0, "In has no pending cloud statement");
+
+                senti_stamp_queue_.push_back({msg->stamp, msg->seq});
+
+                while (senti_stamp_queue_.size() > 20)
+            {
+                senti_stamp_queue_.pop_front();
+            }
+		NODELET_INFO_STREAM_THROTTLE(
+    		1.0,
+    		"Cloud callback.sentistamp queue size = " << senti_stamp_queue_.size()
+    		<< ", has_pending_cloud = " << has_pending_cloud_);
+	    }
+
+	  }
+
+	    if (publish_pending){
+		synced_lidar_pub.publish(cloud_to_publish);
+		NODELET_INFO_STREAM_THROTTLE(1.0, "Published pending cloud with IC timestamp");
+		NODELET_INFO_STREAM_THROTTLE(
+    		1.0,
+    		"Cloud callback. queue size = " << senti_stamp_queue_.size()
+    		<< ", has_pending_cloud = " << has_pending_cloud_);
+	 }
+        }
 
     void create_laser_scan_pubs() {
         // NOTE: always create the 2nd topic
@@ -161,14 +224,64 @@ class OusterDriver : public OusterSensor {
             }
 
             processors.push_back(
-                PointCloudProcessorFactory::create_point_cloud_processor(
-                    point_type, info, tf_bcast.point_cloud_frame_id(),
-                    tf_bcast.apply_lidar_to_sensor_transform(), organized,
-                    destagger, min_range, max_range, v_reduction, mask_path,
-                    [this](PointCloudProcessor_OutputType msgs) {
-                        for (size_t i = 0; i < msgs.size(); ++i)
-                            lidar_pubs[i].publish(*msgs[i]);
-                    }));
+                    PointCloudProcessorFactory::create_point_cloud_processor(
+                        point_type, info, tf_bcast.point_cloud_frame_id(),
+                        tf_bcast.apply_lidar_to_sensor_transform(), organized,
+                        destagger, min_range, max_range, v_reduction, mask_path,
+                        [this](PointCloudProcessor_OutputType msgs)
+                        {
+                            for (size_t i = 0; i < msgs.size(); ++i)
+                            {
+
+                                lidar_pubs[i].publish(*msgs[i]);
+
+                                // Only publish one Sentiboard-synced pointcloud topic.
+                                // For single-return Ouster LEGACY mode, i == 0 is the normal /ouster/points.
+                                if (i != 0)
+                                {
+                                    continue;
+                                }
+                                ++lidar_scans;
+
+   				 sensor_msgs::PointCloud2 synced_msg;
+    				bool publish_now = false;
+
+	    			{
+			            std::lock_guard<std::mutex> lock(senti_stamp_mutex_);
+
+    				    if (!senti_stamp_queue_.empty()) {
+     				       const auto senti_time = senti_stamp_queue_.front();
+      			     	 	senti_stamp_queue_.pop_front();
+
+	            			synced_msg = *msgs[i];
+        	    			synced_msg.header.stamp = senti_time.stamp;
+            				synced_msg.header.seq = senti_time.seq;
+	
+        	    			publish_now = true;
+
+					NODELET_INFO_STREAM(
+        				  "Matched cloud directly with queued IC. "
+        				  << "cloud_count=" << lidar_scans
+      					  << ", ic_seq=" << senti_time.seq
+  					  << ", queue_size_after=" << senti_stamp_queue_.size());
+        				} else {
+            				pending_cloud_ = *msgs[i];
+            				has_pending_cloud_ = true;
+       				 }
+    				}	
+
+	    			if (publish_now) {
+        				synced_lidar_pub.publish(synced_msg);
+    				} else {
+        				++missed_ic;
+        				NODELET_WARN_STREAM_THROTTLE(
+            				1.0,
+            				"No Sentiboard timestamp available yet. Stored pending cloud. "
+            				<< "Pending count: " << missed_ic
+            				<< ", total lidar msgs: " << lidar_scans);
+    					}
+                       	     }
+                        }));
 
             // warn about profile incompatibility
             if (PointCloudProcessorFactory::point_type_requires_intensity(
@@ -269,6 +382,21 @@ class OusterDriver : public OusterSensor {
 
     ros::Publisher telemetry_pub;
     TelemetryHandler::HandlerType telemetry_handler;
+
+    ros::Subscriber senti_lidar_ic_sub;
+    ros::Publisher synced_lidar_pub;
+
+    //std::deque<ros::Time> senti_stamp_queue_;
+    struct SentiTime{
+        ros::Time stamp;
+        std::uint32_t seq;
+    };
+    std::deque<SentiTime> senti_stamp_queue_;
+    std::mutex senti_stamp_mutex_;
+    std::uint32_t missed_ic;
+    std::uint64_t lidar_scans;
+    bool has_pending_cloud_ = false;
+    sensor_msgs::PointCloud2 pending_cloud_;
 };
 
 }  // namespace ouster_ros
