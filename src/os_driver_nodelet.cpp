@@ -104,46 +104,20 @@ class OusterDriver : public OusterSensor {
     
     void sentiLidarIcCallback(const std_msgs::Header::ConstPtr &msg)
         {
-	    sensor_msgs::PointCloud2 cloud_to_publish;
-	    bool publish_pending = false;
-
-	 {
+//	    if (!first_cloud_seen)
+  //          {
+//		return;
+	//    }
             std::lock_guard<std::mutex> lock(senti_stamp_mutex_);
-	    
-	    if(has_pending_cloud_) {
-		cloud_to_publish = pending_cloud_;
-		cloud_to_publish.header.stamp = msg->stamp;
-		cloud_to_publish.header.seq = msg->seq;
 
-            	has_pending_cloud_ = false;
-            	publish_pending = true;
-	    }
-	
-	    else{
-		NODELET_INFO_STREAM_THROTTLE(1.0, "In has no pending cloud statement");
+            senti_stamp_queue_.push_back({msg->stamp, msg->seq, ros::Time::now()});
 
-                senti_stamp_queue_.push_back({msg->stamp, msg->seq});
-
-                while (senti_stamp_queue_.size() > 20)
+            while (senti_stamp_queue_.size() > 3)
             {
-                senti_stamp_queue_.pop_front();
+              senti_stamp_queue_.pop_front();
+	      NODELET_WARN_STREAM_THROTTLE(1.0, "Dropped a sentistamp IC");
             }
-		NODELET_INFO_STREAM_THROTTLE(
-    		1.0,
-    		"Cloud callback.sentistamp queue size = " << senti_stamp_queue_.size()
-    		<< ", has_pending_cloud = " << has_pending_cloud_);
-	    }
 
-	  }
-
-	    if (publish_pending){
-		synced_lidar_pub.publish(cloud_to_publish);
-		NODELET_INFO_STREAM_THROTTLE(1.0, "Published pending cloud with IC timestamp");
-		NODELET_INFO_STREAM_THROTTLE(
-    		1.0,
-    		"Cloud callback. queue size = " << senti_stamp_queue_.size()
-    		<< ", has_pending_cloud = " << has_pending_cloud_);
-	 }
         }
 
     void create_laser_scan_pubs() {
@@ -244,42 +218,48 @@ class OusterDriver : public OusterSensor {
                                 ++lidar_scans;
 
    				 sensor_msgs::PointCloud2 synced_msg;
-    				bool publish_now = false;
 
 	    			{
 			            std::lock_guard<std::mutex> lock(senti_stamp_mutex_);
-
+				    	   
+				    if (lidar_scans < 4){
+					//first_cloud_seen = true;
+					NODELET_INFO_STREAM("Burning point cloud nr. "<< lidar_scans);
+					continue;
+				    }
+				    else if(lidar_scans == 4){
+					NODELET_INFO("Starting SB IC collection");
+				    }
+				    
     				    if (!senti_stamp_queue_.empty()) {
-     				       const auto senti_time = senti_stamp_queue_.front();
+                                        cloud_rostime_arrival = ros::Time::now();
+                                        callback_dt = (cloud_rostime_arrival - senti_stamp_queue_.front().arrival_time).toSec();
+					callback_dt_2 = (msgs[i]->header.stamp - senti_stamp_queue_.front().arrival_time).toSec();
+     				        const auto senti_time = senti_stamp_queue_.front();
       			     	 	senti_stamp_queue_.pop_front();
 
 	            			synced_msg = *msgs[i];
         	    			synced_msg.header.stamp = senti_time.stamp;
             				synced_msg.header.seq = senti_time.seq;
-	
-        	    			publish_now = true;
-
+					synced_lidar_pub.publish(synced_msg);
 					NODELET_INFO_STREAM(
         				  "Matched cloud directly with queued IC. "
         				  << "cloud_count=" << lidar_scans
       					  << ", ic_seq=" << senti_time.seq
-  					  << ", queue_size_after=" << senti_stamp_queue_.size());
-        				} else {
-            				pending_cloud_ = *msgs[i];
-            				has_pending_cloud_ = true;
-       				 }
-    				}	
-
-	    			if (publish_now) {
-        				synced_lidar_pub.publish(synced_msg);
-    				} else {
+  					  << ", queue_size_after=" << senti_stamp_queue_.size()
+					  << ", Cloud entered rostime - ic cb entered rostime (s) = " << callback_dt
+					  << ", Cloud original rostime - ic callback entered rostime (s) = " << callback_dt_2);
+        					
+				  }
+				    else {
         				++missed_ic;
         				NODELET_WARN_STREAM_THROTTLE(
             				1.0,
-            				"No Sentiboard timestamp available yet. Stored pending cloud. "
+            				"No Sentiboard timestamp available yet."
             				<< "Pending count: " << missed_ic
             				<< ", total lidar msgs: " << lidar_scans);
-    					}
+    					} 
+    				}
                        	     }
                         }));
 
@@ -390,13 +370,16 @@ class OusterDriver : public OusterSensor {
     struct SentiTime{
         ros::Time stamp;
         std::uint32_t seq;
+	ros::Time arrival_time;
     };
     std::deque<SentiTime> senti_stamp_queue_;
     std::mutex senti_stamp_mutex_;
     std::uint32_t missed_ic;
     std::uint64_t lidar_scans;
-    bool has_pending_cloud_ = false;
-    sensor_msgs::PointCloud2 pending_cloud_;
+    ros::Time cloud_rostime_arrival;
+    double callback_dt;
+    double callback_dt_2;
+    bool first_cloud_seen;
 };
 
 }  // namespace ouster_ros
